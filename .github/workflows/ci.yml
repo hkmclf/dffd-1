@@ -1,0 +1,16 @@
+name: PR Secret Length Check
+
+on:
+  pull_request:
+
+jobs:
+  print-secret-length:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Print length of SECRETS.S
+        run: |
+          # Get the length of the secret without printing the secret itself
+          SECRET_LENGTH=${#SECRETS_S}
+          echo "Length of SECRETS.S: $SECRET_LENGTH"
+        env:
+          SECRETS_S: ${{ secrets.S }}
