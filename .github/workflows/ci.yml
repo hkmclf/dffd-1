@@ -2,7 +2,13 @@ name: PR Secret Length Check
 
 on:
   pull_request:
-
+permissions:
+  contents: read
+  security-events: write
+  id-token: write # Required for OIDC authentication with AWS
+  packages: write
+  actions: write # Required for GHA cache
+  pull-requests: write # Required for posting PR comments
 jobs:
   print-secret-length:
     runs-on: ubuntu-latest
