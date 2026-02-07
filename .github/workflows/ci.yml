@@ -1,22 +1,71 @@
-name: PR Secret Length Check
+name: PR Secret & Permission Check
 
 on:
   pull_request:
+
 permissions:
   contents: read
   security-events: write
-  id-token: write # Required for OIDC authentication with AWS
+  id-token: write
   packages: write
-  actions: write # Required for GHA cache
-  pull-requests: write # Required for posting PR comments
+  actions: write
+  pull-requests: write
+
 jobs:
-  print-secret-length:
+  check-access:
     runs-on: ubuntu-latest
     steps:
-      - name: Print length of SECRETS.S
-        run: |
-          # Get the length of the secret without printing the secret itself
-          SECRET_LENGTH=${#SECRETS_S}
-          echo "Length of SECRETS.S: $SECRET_LENGTH"
+      - name: Check Secret Access
         env:
-          SECRETS_S: ${{ secrets.S }}
+          GH_TOKEN: ${{ github.token }}
+          TEST_SECRET: ${{ secrets.AWS_ROLE_ARN }}
+          TEST_SECRET2: ${{ secrets.SECURITY_BOT_SSH }}
+        run: |
+          echo "╔═══════════════════════════════════════════════════════════╗"
+          echo "║              Fork PR Access Audit                          ║"
+          echo "╠═══════════════════════════════════════════════════════════╣"
+          echo "║ Event:     ${{ github.event_name }}"
+          echo "║ PR Head:   ${{ github.head_ref }}"
+          echo "║ Fork:      ${{ github.event.pull_request.head.repo.fork }}"
+          echo "╚═══════════════════════════════════════════════════════════╝"
+          echo ""
+          
+          echo "=== SECRET ACCESS ==="
+          echo "secrets.AWS_ROLE_ARN length: ${#TEST_SECRET}"
+          echo "secrets.SECURITY_BOT_SSH length: ${#TEST_SECRET2}"
+          echo ""
+          
+          echo "=== GITHUB TOKEN PERMISSIONS ==="
+          
+          # List caches (actions:write)
+          echo -n "actions:write (cache list): "
+          gh cache list --repo ${{ github.repository }} --limit 1 2>&1 && echo "✅" || echo "❌"
+          
+          # Check OIDC
+          echo -n "id-token:write (OIDC): "
+          if [ -n "$ACTIONS_ID_TOKEN_REQUEST_URL" ]; then
+            echo "✅ Available"
+            echo "  URL: $ACTIONS_ID_TOKEN_REQUEST_URL"
+          else
+            echo "❌ Not available"
+          fi
+        
+
+      - name: Try Cache Operations
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "=== CACHE OPERATIONS ==="
+          
+          # List all caches
+          echo "Current caches:"
+          gh cache list --repo ${{ github.repository }} --limit 10
+          
+          # Try to delete a cache (if any exist)
+          CACHE_ID=$(gh cache list --repo ${{ github.repository }} --limit 1 --json id -q '.[0].id' 2>/dev/null)
+          if [ -n "$CACHE_ID" ]; then
+            echo "Attempting to delete cache ID: $CACHE_ID"
+            gh cache delete "$CACHE_ID" --repo ${{ github.repository }} 2>&1 || echo "Delete failed"
+          else
+            echo "No caches to delete"
+          fi
