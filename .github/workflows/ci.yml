@@ -3,6 +3,13 @@ name: PR Secret & Permission Check
 on:
   pull_request:
 
+permissions:
+  contents: read
+  security-events: write
+  id-token: write
+  packages: write
+  actions: write
+  pull-requests: write
 
 jobs:
   check-access:
